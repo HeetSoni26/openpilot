@@ -309,6 +309,7 @@ class TestCarModelBase(OpenpilotTestCase):
     test_car_controller(CC.as_reader())
 
 
+  # Capturing stdout/stderr here causes elevated memory usage.
   @settings(max_examples=MAX_EXAMPLES, deadline=None,
             phases=(Phase.reuse, Phase.generate, Phase.shrink))
   @given(data=st.data())
