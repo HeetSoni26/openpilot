@@ -1,26 +1,29 @@
 import time
 import os
-import pytest
 import random
-import unittest # noqa: TID251
+import unittest
 from collections import defaultdict, Counter
 import hypothesis.strategies as st
 from hypothesis import Phase, given, settings
 from openpilot.common.parameterized import parameterized_class
+from openpilot.common.test import OpenpilotTestCase
 from opendbc.car import DT_CTRL, gen_empty_fingerprint, structs
 from opendbc.car.can_definitions import CanData
 from opendbc.car.car_helpers import FRAME_FINGERPRINT, interfaces
 from opendbc.car.fingerprints import MIGRATION
 from opendbc.car.honda.values import HondaFlags
+from opendbc.car.interfaces import ACCEL_MIN, ACCEL_MAX
 from opendbc.car.structs import car
 from opendbc.car.tests.routes import non_tested_cars, routes, CarTestRoute
 from opendbc.car.values import Platform, PLATFORMS
 from opendbc.safety.tests.libsafety import libsafety_py
 from openpilot.common.basedir import BASEDIR
 from openpilot.selfdrive.pandad import can_capnp_to_list
+from openpilot.selfdrive.test.fuzzy_generation import FuzzyGenerator
 from openpilot.selfdrive.test.helpers import read_segment_list
 from openpilot.common.hardware.hw import DEFAULT_DOWNLOAD_CACHE_ROOT
 from openpilot.tools.lib.logreader import LogReader, LogsUnavailable, openpilotci_source, internal_source, comma_api_source
+from openpilot.tools.lib.file_sources import Source
 from openpilot.tools.lib.route import SegmentName
 
 SafetyModel = car.CarParams.SafetyModel
@@ -40,6 +43,10 @@ INTERNAL_SEG_LIST = os.environ.get("INTERNAL_SEG_LIST", "")
 INTERNAL_SEG_CNT = int(os.environ.get("INTERNAL_SEG_CNT", "0"))
 MAX_EXAMPLES = int(os.environ.get("MAX_EXAMPLES", "300"))
 CI = os.environ.get("CI", None) is not None
+
+# controlsd clips curvature; keep TX fuzz inside the same bound
+MAX_CURVATURE = 0.2
+NUM_TX_FUZZY_FRAMES = 20
 
 
 def get_test_cases() -> list[tuple[str, CarTestRoute | None]]:
@@ -65,9 +72,9 @@ def get_test_cases() -> list[tuple[str, CarTestRoute | None]]:
   return test_cases
 
 
-@pytest.mark.slow
-@pytest.mark.shared_download_cache
-class TestCarModelBase(unittest.TestCase):
+class TestCarModelBase(OpenpilotTestCase):
+  SLOW_TEST = True
+  SHARED_DOWNLOAD_CACHE = True
   platform: Platform | None = None
   test_route: CarTestRoute | None = None
 
@@ -130,7 +137,7 @@ class TestCarModelBase(unittest.TestCase):
       segment_range = f"{cls.test_route.route}/{seg}"
 
       try:
-        sources = [internal_source] if len(INTERNAL_SEG_LIST) else [openpilotci_source, comma_api_source]
+        sources: list[Source] = [internal_source] if len(INTERNAL_SEG_LIST) else [openpilotci_source, comma_api_source]
         lr = LogReader(segment_range, sources=sources, sort_by_time=True)
         return cls.get_testing_data_from_logreader(lr)
       except (LogsUnavailable, AssertionError):
@@ -250,7 +257,7 @@ class TestCarModelBase(unittest.TestCase):
 
       # Don't check relay malfunction on disabled routes (relay closed),
       # or before fingerprinting is done (elm327 and noOutput)
-      if self.openpilot_enabled and t / 1e4 > self.car_safety_mode_frame:
+      if self.car_safety_mode_frame is not None and t / 1e4 > self.car_safety_mode_frame:
         self.assertFalse(self.safety.get_relay_malfunction())
       else:
         self.safety.set_relay_malfunction(False)
@@ -301,8 +308,93 @@ class TestCarModelBase(unittest.TestCase):
     CC = structs.CarControl(cruiseControl=structs.CarControl.CruiseControl(resume=True))
     test_car_controller(CC.as_reader())
 
-  # Skip stdout/stderr capture with pytest, causes elevated memory usage
-  @pytest.mark.nocapture
+
+  @settings(max_examples=MAX_EXAMPLES, deadline=None,
+            phases=(Phase.reuse, Phase.generate, Phase.shrink))
+  @given(data=st.data())
+  def test_panda_safety_tx_fuzzy(self, data):
+    """
+      Fuzz a short sequence of CarControl through CarInterface.apply and assert
+      panda safety_tx_hook never blocks a message openpilot generates.
+
+      State is aligned between openpilot and panda (controls_allowed / cruise /
+      gas_pressed). Actuator values stay inside the ranges controlsd uses before
+      apply(), and vary across frames so history-dependent TX checks (torque
+      samples, RT rate limits) are exercised — the fixed cases in
+      test_panda_safety_tx_cases cannot cover those.
+    """
+    if self.CP.dashcamOnly:
+      self.skipTest("no need to check panda safety for dashcamOnly")
+
+    if self.CP.notCar:
+      self.skipTest("Skipping test for notCar")
+
+    active = data.draw(st.booleans())
+    self.safety.set_controls_allowed(active)
+    self.safety.set_cruise_engaged_prev(data.draw(st.booleans()))
+    self.safety.set_gas_pressed_prev(False)
+
+    # one draw of per-frame actuator deltas (keeps hypothesis draw count low)
+    delta_strat = st.fixed_dictionaries({
+      "d_torque": st.floats(min_value=-0.25, max_value=0.25, allow_nan=False, allow_infinity=False),
+      "d_angle": st.floats(min_value=-15.0, max_value=15.0, allow_nan=False, allow_infinity=False),
+      "d_curvature": st.floats(min_value=-0.02, max_value=0.02, allow_nan=False, allow_infinity=False),
+      "d_accel": st.floats(min_value=-1.0, max_value=1.0, allow_nan=False, allow_infinity=False),
+      "speed": st.floats(min_value=0.0, max_value=40.0, allow_nan=False, allow_infinity=False),
+      "gas": st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False),
+      "brake": st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False),
+    })
+    frame_deltas = data.draw(st.lists(delta_strat, min_size=NUM_TX_FUZZY_FRAMES, max_size=NUM_TX_FUZZY_FRAMES))
+
+    # structural scaffold for any future Actuators fields (enums etc.)
+    actuators_base = FuzzyGenerator.get_random_msg(data.draw, car.CarControl.Actuators, real_floats=True)
+
+    torque = angle = curvature = accel = 0.0
+    CI = self.CarInterface(self.CP)
+    now_nanos = 0
+    msgs_sent = 0
+
+    for frame, d in enumerate(frame_deltas):
+      # advance panda timer so RT rate-limit windows behave like real controlsd cadence
+      self.safety.set_timer(int(frame * DT_CTRL * 1e6))
+
+      if active:
+        torque = max(-1.0, min(1.0, torque + d["d_torque"]))
+        angle = max(-180.0, min(180.0, angle + d["d_angle"]))
+        curvature = max(-MAX_CURVATURE, min(MAX_CURVATURE, curvature + d["d_curvature"]))
+        accel = max(ACCEL_MIN, min(ACCEL_MAX, accel + d["d_accel"]))
+        actuators = {**actuators_base,
+                     "torque": torque,
+                     "steeringAngleDeg": angle,
+                     "curvature": curvature,
+                     "accel": accel,
+                     "speed": d["speed"],
+                     "gas": d["gas"],
+                     "brake": d["brake"]}
+      else:
+        # controlsd zeroes actuators when not active; only keep enum scaffold
+        actuators = {"longControlState": actuators_base.get("longControlState", 0)}
+        torque = angle = curvature = accel = 0.0
+
+      CC = car.CarControl.new_message(
+        actuators=actuators,
+        enabled=active,
+        latActive=active,
+        longActive=active,
+        cruiseControl={"cancel": (not active), "resume": active},
+      )
+
+      CI.update([])
+      _, sendcan = CI.apply(CC.as_reader(), now_nanos)
+      now_nanos += DT_CTRL * 1e9
+      msgs_sent += len(sendcan)
+      for addr, dat, bus in sendcan:
+        to_send = libsafety_py.make_CANPacket(addr, bus % 4, dat)
+        self.assertTrue(self.safety.safety_tx_hook(to_send), (addr, dat, bus, active, frame))
+
+    self.assertGreater(msgs_sent, 0)
+
+  # Capturing stdout/stderr here causes elevated memory usage.
   @settings(max_examples=MAX_EXAMPLES, deadline=None,
             phases=(Phase.reuse, Phase.generate, Phase.shrink))
   @given(data=st.data())
@@ -470,7 +562,6 @@ class TestCarModelBase(unittest.TestCase):
 
 
 @parameterized_class(('platform', 'test_route'), get_test_cases())
-@pytest.mark.xdist_group_class_property('test_route')
 class TestCarModel(TestCarModelBase):
   pass
 
